@@ -5,15 +5,21 @@ import (
 	"github.com/intel-go/nff-go/flow"
 	"github.com/intel-go/nff-go/packet"
 	"github.com/intel-go/nff-go/types"
+	"github.com/intel-go/nff-go/common"
 )
 
 var pkt_cnt int = 0
 
+var sessionManager SessionManager
+
+var f *flow.Flow
+
 func main() {
 	fmt.Println("App started.")
+	sessionManager = SessionManager{SendReplyCallback: send}
 	config := flow.Config{
 		DisableScheduler: false,
-		BurstSize: 4,
+		BurstSize: 1,
 	}
 	err := flow.SystemInit(&config)
 	if err != nil {
@@ -21,14 +27,40 @@ func main() {
 		return
 	}
 	//inQueue := 1
+
 	port := "eth0" // TODO: hardcoded
 	firstFlow, err := flow.SetReceiverOS(port)
 	//firstFlow, err := flow.SetReceiverXDP(port, inQueue)
 	flow.CheckFatal(flow.SetHandler(firstFlow, dumper, nil))
 	flow.CheckFatal(flow.SetHandler(firstFlow, handleVXLAN, nil))
-	flow.CheckFatal(flow.SetHandler(firstFlow, handlePPPoE, nil))
+	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, nil))
 	flow.CheckFatal(flow.SetSenderOS(firstFlow, port))
+	f = firstFlow
 	flow.CheckFatal(flow.SystemStart())
+}
+
+func send() {
+	fmt.Println("Callback invoked!")
+	pkt, err := packet.NewPacket()
+	if err != nil {
+		common.LogFatal(common.Debug, err)
+	}
+
+	// FIXME: hardcoded addresses
+	pkt.Ether.DAddr = types.MACAddress{0x00, 0x07, 0x0d, 0xaf, 0xf4, 0x54}
+	pkt.Ether.SAddr = types.MACAddress{0x00, 0x07, 0x0d, 0xaf, 0xf4, 0x55}
+	pkt.Ether.EtherType = types.SwapPPPoEDNumber
+	pkt.ParseL3()
+	pppoe := pkt.GetPPPoEDNoTags()
+	pppoe.SessionId = 0x0001
+	pppoe.Code = 0x09
+
+
+	pkt.SendPacketOS(flow.GetIODevice("eth0").(int))
+	//socketID := flow.GetIODevice("eth0")
+	//fmt.Println("Success? ", ok)
+	//pkt.SendPacket(0)
+
 }
 
 func dumper(currentPacket *packet.Packet, context flow.UserContext) {
@@ -55,22 +87,30 @@ func handleVXLAN(current *packet.Packet, context flow.UserContext) {
 	}
 }
 
-func handlePPPoE(current *packet.Packet, ctx flow.UserContext) {
+func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 	current.ParseL3()
-
-
+	var sessionCtx SessionContext
 	if current.Ether.EtherType == types.SwapPPPoEDNumber {
 		p := current.GetPPPoED()
 		if p != nil {
-			fmt.Println("Got PPPoED packet ", p)
+			fmt.Println("Got PPPoED packet ", p.Code, p.Len)
 		}
+		fmt.Println(p.Tags)
+		sessionCtx.sessionId = p.SessionId
+		//sessionCtx.attributes = p.Tags
 	} else if current.Ether.EtherType == types.SwapPPPoESNumber {
 		current.GetPPPoES()
 	} else {
 		// Should drop
+		return false
 	}
+	// handle session event in separate goroutine
+	go sessionManager.HandleSessionEvent(sessionCtx)
 
-
-
+	return false
 }
+
+//func handleSession(ctx SessionContext) {
+//
+//}
 
