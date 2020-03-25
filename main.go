@@ -9,18 +9,35 @@ import (
 	"errors"
 	"bytes"
 	"encoding/binary"
+	"encoding/gob"
+	"encoding/hex"
 )
 
 var pkt_cnt int = 0
 
 var sessionManager SessionManager
 
-var codeSessionEventMap = map[uint32]SessionEvent {
-	packet.PADI 			: PADI,
-	packet.PADO 			: PADO,
-	packet.PADR 			: PADR,
-	packet.PADS 			: PADS,
-	(packet.LCP<<8)|0x01 	: LCP_ConfReq,
+type SessionCode struct {
+	Protocol uint16
+	Code     uint8
+}
+
+var codeSessionEventMap = map[SessionCode]SessionEvent {
+	// PPPoE Discovery
+	SessionCode{0, packet.PADI} 	: PADI,
+	SessionCode{0, packet.PADO} 	: PADO,
+	SessionCode{0, packet.PADR} 	: PADR,
+	SessionCode{0, packet.PADS} 	: PADS,
+
+	// Link Control Protocol
+	SessionCode{packet.LCP, 0x01} 	: LCP_ConfReq,
+	SessionCode{packet.LCP, 0x02} 	: LCP_ConfAck,
+
+	// Challenge-Handshake Authentication Protocol
+	SessionCode{packet.CHAP, 0x01} : CHAPChallenge,
+	SessionCode{packet.CHAP, 0x02} : CHAPResponse,
+	SessionCode{packet.CHAP, 0x03} : CHAPSuccess,
+	SessionCode{packet.CHAP, 0x03} : CHAPFailure,
 }
 
 func main() {
@@ -49,6 +66,147 @@ func main() {
 	flow.CheckFatal(flow.SystemStart())
 }
 
+func preparePPPoEPacket(pkt *packet.Packet, ctx SessionContext, code uint8) error {
+	var totalLen uint16
+	tags := getTagsFromAttributes(ctx.attributes, &totalLen)
+	if packet.InitEmptyPPPoEDPacket(pkt, uint(totalLen)) == false {
+		fmt.Println("Cannot initalizie PPPoED packet!")
+		return errors.New("cannot initialize PPPoED packet")
+	}
+	pppoe := pkt.GetPPPoEDNoTags()
+	pppoe.VersionType = 0x11
+	pppoe.SessionId = ctx.sessionId
+	pppoe.Len = packet.SwapBytesUint16(totalLen)
+	pppoe.Tags = tags
+	pppoe.Code = code
+	pkt.PacketBytesChange(types.EtherLen + types.PPPoELen, convertToBytes(pppoe.Tags))
+	return nil
+}
+
+func preparePPPPacket(pkt *packet.Packet, ctx SessionContext, protocol uint16, code uint8) error {
+	var totalLen uint8
+	options := getOptionsFromAttributes(ctx.attributes, &totalLen)
+	totalLen += types.PPPLen
+	if !packet.InitEmptyPPPoESPacket(pkt, uint(totalLen)) {
+		fmt.Println("Cannot initalizie PPPoES packet!")
+		return errors.New("cannot initialize PPPoES packet")
+	}
+	pppoes := pkt.GetPPPoES()
+	pppoes.VersionType = 0x11
+	pppoes.SessionId = ctx.sessionId
+	pppoes.Len = packet.SwapBytesUint16(uint16(totalLen + 2))
+	pppoes.Code = 0x00
+	pppoes.Protocol = packet.SwapBytesUint16(protocol)
+
+	ppp := pkt.GetPPPNoOptions()
+	ppp.Code = code
+	ppp.Identifier = ctx.transactionId
+	ppp.Length = packet.SwapBytesUint16(uint16(totalLen))
+	ppp.Options = options
+	fmt.Println("Option converted: ", convertPPPOptionsToBytes(ppp.Options))
+	pkt.PacketBytesChange(types.EtherLen + types.PPPoESLen + types.PPPLen, convertPPPOptionsToBytes(ppp.Options))
+	return nil
+}
+
+func getCHAPValueFromAttributes(attrs map[string]interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+
+	val, ok := attrs["CHAP-Secret"]
+	if !ok {
+		return nil, errors.New("CHAP value has not been provided")
+	}
+
+	err := enc.Encode(val)
+	if err != nil {
+		return nil, errors.New("cannot convert CHAP value to byte array")
+	}
+
+	return buf.Bytes()[4:], nil
+}
+
+func (ctx SessionContext) getAttributeAsByteArray(attr string) ([]byte, error) {
+	val, ok := ctx.attributes[attr]
+	if !ok {
+		return nil, fmt.Errorf("attribute '%v' has not been provided", attr)
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	fmt.Println("Encoding value: ", val)
+	err := enc.Encode(val)
+	if err != nil {
+		return nil, fmt.Errorf("cannot convert attribute '%v' to byte array", attr)
+	}
+	fmt.Println("Encoded value: ", hex.Dump(buf.Bytes()[4:]))
+	return buf.Bytes()[4:], nil
+}
+
+func prepareCHAPPacket(pkt *packet.Packet, ctx SessionContext, protocol uint16, code uint8) error {
+	value, err := ctx.getAttributeAsByteArray("CHAP-Secret")
+	if err != nil {
+		return err
+	}
+	name, err := ctx.getAttributeAsByteArray("CHAP-Name")
+	if err != nil {
+		return err
+	}
+
+	valueSize := uint8(len(value))
+
+	totalLen := types.PPPLen + 1 + len(name) + int(valueSize)
+	if !packet.InitEmptyPPPoESPacket(pkt, uint(totalLen)) {
+		fmt.Println("Cannot initalizie PPPoES packet!")
+		return errors.New("cannot initialize PPPoES packet")
+	}
+
+	// FIXME: this is redundant
+	pppoes := pkt.GetPPPoES()
+	pppoes.VersionType = 0x11
+	pppoes.SessionId = ctx.sessionId
+	pppoes.Len = packet.SwapBytesUint16(uint16(totalLen + 2))
+	pppoes.Code = 0x00
+	pppoes.Protocol = packet.SwapBytesUint16(protocol)
+
+	chap, err := pkt.GetCHAP()
+	chap.Code = code
+	chap.Identifier = ctx.transactionId
+	chap.Length = packet.SwapBytesUint16(uint16(totalLen))
+
+	chap.ValueSize = valueSize
+	copy(chap.Value, value)
+	copy(chap.Name, name)
+	//pkt.PacketBytesChange(types.EtherLen + types.PPPoESLen + types.PPPLen + 1, value)
+	//pkt.PacketBytesChange(types.EtherLen + types.PPPoESLen + types.PPPLen + 1 + uint(valueSize), name)
+	//fmt.Println("CHAP Value: ", hex.Dump(chap.Value))
+	fmt.Println("Constructed CHAP packet:\n", hex.Dump(pkt.GetRawPacketBytes()))
+
+	return nil
+}
+
+func getOptionsFromAttributes(attrs map[string]interface{}, totalLen *uint8) []packet.PPPOption {
+	var options []packet.PPPOption
+	for key, val := range attrs {
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+		fmt.Println("Buf content: ", buf.Bytes())
+		fmt.Println("Encoding value: ", val)
+		err := enc.Encode(val)
+		if err != nil {
+			continue
+		}
+		// I don't know why, but gob.Encode returns some 4 random bytes at the beginning
+		v := buf.Bytes()[4:]
+		fmt.Println("Encoded value: ", v)
+		options = append(options, packet.PPPOption{Type: packet.PPPOptionMap[key],
+													Length: uint8(len(v)+2),
+													Value: v})
+		*totalLen += uint8(len(v)+2)
+		fmt.Println("Options: ", options, "Total Len=", *totalLen)
+	}
+	return options
+}
+
 func send(ctx SessionContext) {
 	fmt.Println("Callback invoked!")
 	pkt, err := packet.NewPacket()
@@ -56,34 +214,40 @@ func send(ctx SessionContext) {
 		common.LogFatal(common.Debug, err)
 	}
 
-	var totalLen uint16
-	tags := getTagsFromAttributes(ctx.attributes, &totalLen)
+	protocol, code, err := fromSessionEventToSessionCode(ctx.event)
+	fmt.Println("SessionCode= ", protocol, code)
+	var ok error
+	if protocol == 0 {
+		ok = preparePPPoEPacket(pkt, ctx, code)
+	} else if protocol == packet.LCP {
+		ok = preparePPPPacket(pkt, ctx, protocol, code)
+	} else if protocol == packet.CHAP {
+		ok = prepareCHAPPacket(pkt, ctx, protocol, code)
+	} else {
+		ok = errors.New("unknown Session Event")
+	}
 
-	if packet.InitEmptyPPPoEDPacket(pkt, uint(totalLen)) == false {
-		fmt.Println("Cannot initalizie PPPoED packet!")
+	if ok != nil {
+		fmt.Println("Sending packet failed!")
 		return
 	}
 
 	pkt.Ether.DAddr = ctx.subscriberMac
 	pkt.Ether.SAddr = flow.GetPortMACAddress(0)
 
-	pppoe := pkt.GetPPPoEDNoTags()
-	pppoe.VersionType = 0x11
-	pppoe.SessionId = ctx.sessionId
-	pppoe.Len = packet.SwapBytesUint16(totalLen)
-	pppoe.Tags = tags
-
-	code, err := fromSessionEventToPPPoECode(ctx.event)
-	if err != nil {
-		common.LogDebug(common.Debug, "Sending reply failed: ", err)
-		return
-	}
-	pppoe.Code = code
-
-	pkt.PacketBytesChange(types.EtherLen + types.PPPoELen, convertToBytes(pppoe.Tags))
-
-	fmt.Println("Sending packet: ", pkt.GetRawPacketBytes())
+	fmt.Println("Sending packet:\n", hex.Dump(pkt.GetRawPacketBytes()))
 	pkt.SendPacket(0)
+}
+
+func convertPPPOptionsToBytes(options []packet.PPPOption) []byte {
+	var bin_buf bytes.Buffer
+	for _, opt := range options {
+		fmt.Println("Option: ", opt)
+		binary.Write(&bin_buf, binary.BigEndian, opt.Type)
+		binary.Write(&bin_buf, binary.BigEndian, opt.Length)
+		bin_buf.Write(opt.Value)
+	}
+	return bin_buf.Bytes()
 }
 
 func convertToBytes(tags []packet.PPPoETag) []byte {
@@ -96,14 +260,25 @@ func convertToBytes(tags []packet.PPPoETag) []byte {
 	return bin_buf.Bytes()
 }
 
-func getTagsFromAttributes(attrs map[string]string, totalLen *uint16) []packet.PPPoETag {
+func getTagsFromAttributes(attrs map[string]interface{}, totalLen *uint16) []packet.PPPoETag {
 	var tags []packet.PPPoETag
+	var buf bytes.Buffer
+    enc := gob.NewEncoder(&buf)
 	for key, val := range attrs {
+		fmt.Println("Encoding value: ", val)
+		err := enc.Encode(val)
+		if err != nil {
+			continue
+		}
+		v := buf.Bytes()[4:]
+		fmt.Println("Encoded value: ", v)
 		tags = append(tags, packet.PPPoETag{Type: packet.PPPoETagMapReversed[key],
-										    Len: uint16(len([]byte(val))),
-											Value: []byte(val)})
-		*totalLen += 4 + uint16(len([]byte(val)))
+										    Len: uint16(len(v)),
+											Value: v})
+		*totalLen += 4 + uint16(len(v))
+		buf.Reset()
 	}
+	fmt.Println("Tags: ", tags)
 	return tags
 }
 
@@ -135,7 +310,11 @@ func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 	current.ParseL3()
 	var sessionCtx SessionContext
 	if current.Ether.EtherType == types.SwapPPPoEDNumber {
-		p := current.GetPPPoED()
+		p, err := current.GetPPPoED()
+		if err != nil {
+			fmt.Println(err)
+			return false
+		}
 		if p != nil {
 			fmt.Println("Got PPPoED packet ", p.Code, packet.SwapBytesUint16(p.Len))
 		}
@@ -145,12 +324,14 @@ func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 	} else if current.Ether.EtherType == types.SwapPPPoESNumber {
 		p := current.GetPPPoES()
 		sessionCtx.sessionId = p.SessionId
-		fmt.Println("PPPoES packet: ", packet.SwapBytesUint16(p.Protocol), p.Code)
-
-
-
-
-		sessionCtx.event = fromPPPCodeToSessionEvent(packet.SwapBytesUint16(p.Protocol), p.Code)
+		ppp, err := current.GetPPP()
+		if err != nil {
+			return false
+		}
+		fmt.Println("PPP Options: ", ppp.Options)
+		sessionCtx.transactionId = ppp.Identifier
+		fmt.Println("PPPoES packet: ", packet.SwapBytesUint16(p.Protocol), ppp.Code)
+		sessionCtx.event = fromPPPCodeToSessionEvent(packet.SwapBytesUint16(p.Protocol), ppp.Code)
 	} else {
 		// Should drop
 		return false
@@ -163,20 +344,20 @@ func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 }
 
 func fromPPPCodeToSessionEvent(protocol uint16, code uint8) SessionEvent {
-	event, ok := codeSessionEventMap[uint32(protocol)<<8|uint32(code)]
+	event, ok := codeSessionEventMap[SessionCode{Protocol: protocol, Code: code}]
 	if ok {
 		return event
 	}
 	return UNKNOWN
 }
 
-func fromSessionEventToPPPoECode(evt SessionEvent) (uint8, error) {
+func fromSessionEventToSessionCode(evt SessionEvent) (uint16, uint8, error) {
 	for key, val := range codeSessionEventMap {
 		if val == evt {
-			return uint8(key), nil
+			return key.Protocol, key.Code, nil
 		}
 	}
-	return 0, errors.New("PPP Code for SessionEvent doesn't exist")
+	return 0, 0, errors.New("PPP Code for SessionEvent doesn't exist")
 }
 
 //func handleSession(ctx SessionContext) {
