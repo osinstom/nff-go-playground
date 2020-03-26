@@ -85,26 +85,26 @@ func preparePPPoEPacket(pkt *packet.Packet, ctx SessionContext, code uint8) erro
 
 func preparePPPPacket(pkt *packet.Packet, ctx SessionContext, protocol uint16, code uint8) error {
 	var totalLen uint8
-	options := getOptionsFromAttributes(ctx.attributes, &totalLen)
-	totalLen += types.PPPLen
-	if !packet.InitEmptyPPPoESPacket(pkt, uint(totalLen)) {
+	options := getOptionsFromAttributes(ctx, &totalLen)
+	if !packet.InitEmptyPPPPacket(pkt, uint(totalLen)) {
 		fmt.Println("Cannot initalizie PPPoES packet!")
 		return errors.New("cannot initialize PPPoES packet")
 	}
 	pppoes := pkt.GetPPPoES()
 	pppoes.VersionType = 0x11
 	pppoes.SessionId = ctx.sessionId
-	pppoes.Len = packet.SwapBytesUint16(uint16(totalLen + 2))
+	pppoes.Len = packet.SwapBytesUint16(uint16(types.PPPLen + totalLen + 2))
 	pppoes.Code = 0x00
 	pppoes.Protocol = packet.SwapBytesUint16(protocol)
 
 	ppp := pkt.GetPPPNoOptions()
 	ppp.Code = code
 	ppp.Identifier = ctx.transactionId
-	ppp.Length = packet.SwapBytesUint16(uint16(totalLen))
+	ppp.Length = packet.SwapBytesUint16(uint16(totalLen + types.PPPLen))
 	ppp.Options = options
-	fmt.Println("Option converted: ", convertPPPOptionsToBytes(ppp.Options))
-	pkt.PacketBytesChange(types.EtherLen + types.PPPoESLen + types.PPPLen, convertPPPOptionsToBytes(ppp.Options))
+
+	pkt.SerializePPPOptions(ppp.Options)
+
 	return nil
 }
 
@@ -124,23 +124,23 @@ func getCHAPValueFromAttributes(attrs map[string]interface{}) ([]byte, error) {
 
 	return buf.Bytes()[4:], nil
 }
-
-func (ctx SessionContext) getAttributeAsByteArray(attr string) ([]byte, error) {
-	val, ok := ctx.attributes[attr]
-	if !ok {
-		return nil, fmt.Errorf("attribute '%v' has not been provided", attr)
-	}
-
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	fmt.Println("Encoding value: ", val)
-	err := enc.Encode(val)
-	if err != nil {
-		return nil, fmt.Errorf("cannot convert attribute '%v' to byte array", attr)
-	}
-	fmt.Println("Encoded value: ", hex.Dump(buf.Bytes()[4:]))
-	return buf.Bytes()[4:], nil
-}
+//
+//func (ctx SessionContext) getAttributeAsByteArray(attr string) ([]byte, error) {
+//	val, ok := ctx.attributes[attr]
+//	if !ok {
+//		return nil, fmt.Errorf("attribute '%v' has not been provided", attr)
+//	}
+//
+//	var buf bytes.Buffer
+//	enc := gob.NewEncoder(&buf)
+//	fmt.Println("Encoding value: ", val)
+//	err := enc.Encode(val)
+//	if err != nil {
+//		return nil, fmt.Errorf("cannot convert attribute '%v' to byte array", attr)
+//	}
+//	fmt.Println("Encoded value: ", hex.Dump(buf.Bytes()[4:]))
+//	return buf.Bytes()[4:], nil
+//}
 
 func prepareCHAPPacket(pkt *packet.Packet, ctx SessionContext, protocol uint16, code uint8) error {
 	value, err := ctx.getAttributeAsByteArray("CHAP-Secret")
@@ -154,8 +154,8 @@ func prepareCHAPPacket(pkt *packet.Packet, ctx SessionContext, protocol uint16, 
 
 	valueSize := uint8(len(value))
 
-	totalLen := types.PPPLen + 1 + len(name) + int(valueSize)
-	if !packet.InitEmptyPPPoESPacket(pkt, uint(totalLen)) {
+	totalLen := + 1 + len(name) + int(valueSize)
+	if !packet.InitEmptyPPPPacket(pkt, uint(totalLen)) {
 		fmt.Println("Cannot initalizie PPPoES packet!")
 		return errors.New("cannot initialize PPPoES packet")
 	}
@@ -164,45 +164,41 @@ func prepareCHAPPacket(pkt *packet.Packet, ctx SessionContext, protocol uint16, 
 	pppoes := pkt.GetPPPoES()
 	pppoes.VersionType = 0x11
 	pppoes.SessionId = ctx.sessionId
-	pppoes.Len = packet.SwapBytesUint16(uint16(totalLen + 2))
+	pppoes.Len = packet.SwapBytesUint16(uint16(types.PPPLen + totalLen + 2))
 	pppoes.Code = 0x00
 	pppoes.Protocol = packet.SwapBytesUint16(protocol)
 
 	chap, err := pkt.GetCHAP()
 	chap.Code = code
 	chap.Identifier = ctx.transactionId
-	chap.Length = packet.SwapBytesUint16(uint16(totalLen))
+	chap.Length = packet.SwapBytesUint16(uint16(types.PPPLen + totalLen))
 
-	chap.ValueSize = valueSize
-	copy(chap.Value, value)
-	copy(chap.Name, name)
-	//pkt.PacketBytesChange(types.EtherLen + types.PPPoESLen + types.PPPLen + 1, value)
-	//pkt.PacketBytesChange(types.EtherLen + types.PPPoESLen + types.PPPLen + 1 + uint(valueSize), name)
-	//fmt.Println("CHAP Value: ", hex.Dump(chap.Value))
+	payload := pkt.GetCHAPChallengeResponsePayload()
+	payload.ValueSize = valueSize
+
+	fmt.Println("Inserting Value, Name ", value, name)
+	payload.Value = value
+	payload.Name = name
+
+	pkt.SerializeCHAPPayload(payload)
+
 	fmt.Println("Constructed CHAP packet:\n", hex.Dump(pkt.GetRawPacketBytes()))
 
 	return nil
 }
 
-func getOptionsFromAttributes(attrs map[string]interface{}, totalLen *uint8) []packet.PPPOption {
+func getOptionsFromAttributes(ctx SessionContext, totalLen *uint8) []packet.PPPOption {
 	var options []packet.PPPOption
-	for key, val := range attrs {
-		var buf bytes.Buffer
-		enc := gob.NewEncoder(&buf)
-		fmt.Println("Buf content: ", buf.Bytes())
-		fmt.Println("Encoding value: ", val)
-		err := enc.Encode(val)
+	for key := range ctx.attributes {
+		v, err := ctx.getAttributeAsByteArray(key)
 		if err != nil {
+			fmt.Println(err)
 			continue
 		}
-		// I don't know why, but gob.Encode returns some 4 random bytes at the beginning
-		v := buf.Bytes()[4:]
-		fmt.Println("Encoded value: ", v)
 		options = append(options, packet.PPPOption{Type: packet.PPPOptionMap[key],
 													Length: uint8(len(v)+2),
 													Value: v})
 		*totalLen += uint8(len(v)+2)
-		fmt.Println("Options: ", options, "Total Len=", *totalLen)
 	}
 	return options
 }
@@ -215,7 +211,7 @@ func send(ctx SessionContext) {
 	}
 
 	protocol, code, err := fromSessionEventToSessionCode(ctx.event)
-	fmt.Println("SessionCode= ", protocol, code)
+
 	var ok error
 	if protocol == 0 {
 		ok = preparePPPoEPacket(pkt, ctx, code)
@@ -237,17 +233,6 @@ func send(ctx SessionContext) {
 
 	fmt.Println("Sending packet:\n", hex.Dump(pkt.GetRawPacketBytes()))
 	pkt.SendPacket(0)
-}
-
-func convertPPPOptionsToBytes(options []packet.PPPOption) []byte {
-	var bin_buf bytes.Buffer
-	for _, opt := range options {
-		fmt.Println("Option: ", opt)
-		binary.Write(&bin_buf, binary.BigEndian, opt.Type)
-		binary.Write(&bin_buf, binary.BigEndian, opt.Length)
-		bin_buf.Write(opt.Value)
-	}
-	return bin_buf.Bytes()
 }
 
 func convertToBytes(tags []packet.PPPoETag) []byte {
@@ -285,7 +270,6 @@ func getTagsFromAttributes(attrs map[string]interface{}, totalLen *uint16) []pac
 func dumper(currentPacket *packet.Packet, context flow.UserContext) {
 	pkt_cnt++
 	fmt.Println("Packet %v received..", pkt_cnt)
-	fmt.Printf("%v", currentPacket.Ether)
 }
 
 // This function should return pointer to the VXLAN payload.
@@ -293,7 +277,6 @@ func handleVXLAN(current *packet.Packet, context flow.UserContext) {
 	current.ParseL3()
 	ipv4 := current.GetIPv4()
 	if ipv4 == nil {
-		fmt.Println("Non IP packet received..")
 		return
 	}
 	current.ParseL4ForIPv4()
@@ -319,11 +302,11 @@ func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 			fmt.Println("Got PPPoED packet ", p.Code, packet.SwapBytesUint16(p.Len))
 		}
 		fmt.Println("Tags: ", p.Tags)
-		sessionCtx.sessionId = p.SessionId
+		sessionCtx.sessionId = packet.SwapBytesUint16(p.SessionId)
 		sessionCtx.event = fromPPPCodeToSessionEvent(0, p.Code)
 	} else if current.Ether.EtherType == types.SwapPPPoESNumber {
 		p := current.GetPPPoES()
-		sessionCtx.sessionId = p.SessionId
+		sessionCtx.sessionId = packet.SwapBytesUint16(p.SessionId)
 		ppp, err := current.GetPPP()
 		if err != nil {
 			return false
@@ -359,8 +342,3 @@ func fromSessionEventToSessionCode(evt SessionEvent) (uint16, uint8, error) {
 	}
 	return 0, 0, errors.New("PPP Code for SessionEvent doesn't exist")
 }
-
-//func handleSession(ctx SessionContext) {
-//
-//}
-
