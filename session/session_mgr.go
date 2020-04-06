@@ -1,4 +1,4 @@
-package main
+package session
 
 import (
 	"fmt"
@@ -49,6 +49,12 @@ func (sm SessionManager) HandleSessionEvent(ctx SessionContext) {
 			ctx.attributes = make(map[string]interface{})
 			ctx.attributes["CHAP-Secret"] = 0x1154007413920232
 			ctx.attributes["CHAP-Name"] = "JUNOS"
+		}
+		case CHAPResponse: {
+			fmt.Println("CHAP Response received")
+			ctx.event = CHAPSuccess
+			ctx.ResetAttributes()
+			ctx.SetAttribute("CHAP-Message", "")
 		}
 		default: {
 			return
