@@ -26,6 +26,11 @@ const (
 	CHAPResponse
 	CHAPSuccess
 	CHAPFailure
+
+	// IPCP events
+	IPCPConfReq
+	IPCPConfAck
+	IPCPConfNak
 )
 
 type SessionContext struct {

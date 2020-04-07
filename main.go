@@ -40,6 +40,11 @@ var codeSessionEventMap = map[SessionCode]session.SessionEvent {
 	SessionCode{packet.CHAP, packet.CHAPResponseCode} 	: session.CHAPResponse,
 	SessionCode{packet.CHAP, packet.CHAPSuccessCode} 	: session.CHAPSuccess,
 	SessionCode{packet.CHAP, packet.CHAPFailureCode} 	: session.CHAPFailure,
+
+	// IP Control Protocol
+	SessionCode{packet.IPCP, packet.IPCPConfReqCode}	: session.IPCPConfReq,
+	SessionCode{packet.IPCP, packet.IPCPConfAckCode}	: session.IPCPConfAck,
+	SessionCode{packet.IPCP, packet.IPCPConfNakCode}	: session.IPCPConfNak,
 }
 
 func main() {
@@ -235,19 +240,19 @@ func send(ctx session.SessionContext) {
 		fmt.Println(err)
 		return
 	}
-	var ok error
+
 	if protocol == 0 {
-		ok = preparePPPoEPacket(pkt, ctx, code)
+		err = preparePPPoEPacket(pkt, ctx, code)
 	} else if protocol == packet.LCP {
-		ok = preparePPPPacket(pkt, ctx, protocol, code)
+		err = preparePPPPacket(pkt, ctx, protocol, code)
 	} else if protocol == packet.CHAP {
-		ok = prepareCHAPPacket(pkt, ctx, protocol, code)
+		err = prepareCHAPPacket(pkt, ctx, protocol, code)
 	} else {
-		ok = errors.New("unknown Session Event")
+		err = errors.New("unknown Session Event")
 	}
 
-	if ok != nil {
-		fmt.Println("Sending packet failed!", err)
+	if err != nil {
+		fmt.Printf("Sending packet failed (%v)!\n", err)
 		return
 	}
 
@@ -349,6 +354,18 @@ func handleCHAP(current *packet.Packet, baseHdr *packet.PPPHdr, ctx *session.Ses
 	}
 }
 
+func handleIPCP(pkt *packet.IPCPHdr, ctx *session.SessionContext) {
+	fmt.Println(pkt.Options)
+	//fmt.Println("IPCP packet received: ", p.Identifier, p.Code, p.Length)
+	for _, opt := range pkt.Options {
+		if opt.Type == packet.IPCP_IPAddressOption {
+			ctx.SetAttribute("IP-Address", opt.Address)
+		}
+	}
+
+}
+
+// TODO: refactor this function, because it looks ugly
 func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 	current.ParseL3()
 	var sessionCtx session.SessionContext
@@ -368,8 +385,16 @@ func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 			case packet.CHAP: {
 				handleCHAP(current, ppp, &sessionCtx)
 			}
+			case packet.IPCP: {
+				ipcp, err := current.GetIPCP()
+				if err != nil {
+					fmt.Println(err)
+					return false
+				}
+				handleIPCP(ipcp, &sessionCtx)
+			}
 			default: {
-
+				return false
 			}
 		}
 		sessionCtx.SetSessionID(packet.SwapBytesUint16(p.SessionId))

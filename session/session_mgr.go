@@ -56,6 +56,10 @@ func (sm SessionManager) HandleSessionEvent(ctx SessionContext) {
 			ctx.ResetAttributes()
 			ctx.SetAttribute("CHAP-Message", "")
 		}
+		case IPCPConfReq: {
+			fmt.Println("IPCP Conf Req received!")
+			ctx.event = IPCPConfAck
+		}
 		default: {
 			return
 		}
