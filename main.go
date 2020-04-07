@@ -36,10 +36,10 @@ var codeSessionEventMap = map[SessionCode]session.SessionEvent {
 	SessionCode{packet.LCP, 0x02} 	: session.LCP_ConfAck,
 
 	// Challenge-Handshake Authentication Protocol
-	SessionCode{packet.CHAP, 0x01} : session.CHAPChallenge,
-	SessionCode{packet.CHAP, 0x02} : session.CHAPResponse,
-	SessionCode{packet.CHAP, 0x03} : session.CHAPSuccess,
-	SessionCode{packet.CHAP, 0x03} : session.CHAPFailure,
+	SessionCode{packet.CHAP, packet.CHAPChallengeCode}	: session.CHAPChallenge,
+	SessionCode{packet.CHAP, packet.CHAPResponseCode} 	: session.CHAPResponse,
+	SessionCode{packet.CHAP, packet.CHAPSuccessCode} 	: session.CHAPSuccess,
+	SessionCode{packet.CHAP, packet.CHAPFailureCode} 	: session.CHAPFailure,
 }
 
 func main() {
@@ -48,8 +48,10 @@ func main() {
 
 	config := flow.Config{
 		NeedKNI:  true,
+		// We use AF_PACKET PMD, TODO: should be configurable.
+		// TODO: Interface name should also be configurable.
 		DPDKArgs: []string{"--no-pci", "--vdev=eth_af_packet0,iface=" + "eth0"},
-		DisableScheduler: false,
+		// For control plane application it's better to process packets sequentially.
 		BurstSize: 1,
 	}
 	err := flow.SystemInit(&config)
@@ -57,12 +59,11 @@ func main() {
 		fmt.Printf("Some error occured: %v\n", err)
 		return
 	}
-	//inQueue := 1
 
 	firstFlow, err := flow.SetReceiver(0)
-	//firstFlow, err := flow.SetReceiverXDP(port, inQueue)
 	flow.CheckFatal(flow.SetHandler(firstFlow, dumper, nil))
 	flow.CheckFatal(flow.SetHandler(firstFlow, handleVXLAN, nil))
+	flow.CheckFatal(flow.SetHandler(firstFlow, handleBNGServiceHeader, nil))
 	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, nil))
 	flow.CheckFatal(flow.SetSender(firstFlow, 0))
 	flow.CheckFatal(flow.SystemStart())
@@ -126,25 +127,9 @@ func getCHAPValueFromAttributes(attrs map[string]interface{}) ([]byte, error) {
 
 	return buf.Bytes()[4:], nil
 }
-//
-//func (ctx SessionContext) getAttributeAsByteArray(attr string) ([]byte, error) {
-//	val, ok := ctx.attributes[attr]
-//	if !ok {
-//		return nil, fmt.Errorf("attribute '%v' has not been provided", attr)
-//	}
-//
-//	var buf bytes.Buffer
-//	enc := gob.NewEncoder(&buf)
-//	fmt.Println("Encoding value: ", val)
-//	err := enc.Encode(val)
-//	if err != nil {
-//		return nil, fmt.Errorf("cannot convert attribute '%v' to byte array", attr)
-//	}
-//	fmt.Println("Encoded value: ", hex.Dump(buf.Bytes()[4:]))
-//	return buf.Bytes()[4:], nil
-//}
 
-func prepareCHAPPacket(pkt *packet.Packet, ctx session.SessionContext, protocol uint16, code uint8) error {
+
+func prepareCHAPChallengeOrResponse(payload *packet.CHAPChallengeResponsePayload, ctx session.SessionContext) (error) {
 	value, err := ctx.GetAttributeAsByteArray("CHAP-Secret")
 	if err != nil {
 		return err
@@ -156,36 +141,69 @@ func prepareCHAPPacket(pkt *packet.Packet, ctx session.SessionContext, protocol 
 
 	valueSize := uint8(len(value))
 
-	totalLen := + 1 + len(name) + int(valueSize)
-	if !packet.InitEmptyPPPPacket(pkt, uint(totalLen)) {
-		fmt.Println("Cannot initalizie PPPoES packet!")
-		return errors.New("cannot initialize PPPoES packet")
-	}
-
-	// FIXME: this is redundant
-	pppoes := pkt.GetPPPoES()
-	pppoes.VersionType = 0x11
-	pppoes.SessionId = ctx.GetSessionID()
-	pppoes.Len = packet.SwapBytesUint16(uint16(types.PPPLen + totalLen + 2))
-	pppoes.Code = 0x00
-	pppoes.Protocol = packet.SwapBytesUint16(protocol)
-
-	chap, err := pkt.GetCHAP()
-	chap.Code = code
-	chap.Identifier = ctx.GetTransactionID()
-	chap.Length = packet.SwapBytesUint16(uint16(types.PPPLen + totalLen))
-
-	payload := pkt.GetCHAPChallengeResponsePayload(chap.Length)
 	payload.ValueSize = valueSize
 
 	fmt.Println("Inserting Value, Name ", value, name)
 	payload.Value = value
 	payload.Name = name
 
+	return nil
+}
+
+func prepareCHAPSuccessOrFailurePayload(payload *packet.CHAPSuccessFailurePayload,
+										ctx session.SessionContext) (error) {
+	message, err := ctx.GetAttributeAsByteArray("CHAP-Message")
+	if err != nil {
+		// don't return error, initialize empty message
+		message = []byte{}
+	}
+	payload.Message = message
+	return nil
+}
+
+// This function prepares CHAP packet to be sent out.
+// FIXME: The function contains unsafe operation: segments of memory are modified (e.g. GetCHAPChallangeResponsePayload)
+// FIXME: before packet MBuf is  // increased (pkt.EncapsulateTail()). We should allocate enough memory in the first line
+// FIXME: of function (InitEmptyPPPPacket()). To do that we need SessionContext to calculate size of its attributes.
+func prepareCHAPPacket(pkt *packet.Packet, ctx session.SessionContext, protocol uint16, code uint8) error {
+	if !packet.InitEmptyPPPPacket(pkt, 0) {
+		fmt.Println("Cannot initalizie PPPoES packet!")
+		return errors.New("cannot initialize PPPoES packet")
+	}
+
+	pppoes := pkt.GetPPPoES()
+	pppoes.VersionType = 0x11
+	pppoes.SessionId = ctx.GetSessionID()
+	pppoes.Code = 0x00
+	pppoes.Protocol = packet.SwapBytesUint16(protocol)
+
+	chap := pkt.GetCHAP()
+	chap.Code = code
+	chap.Identifier = ctx.GetTransactionID()
+
+	var payload interface{}
+	var payloadSize int
+	if code == packet.CHAPChallengeCode || code == packet.CHAPResponseCode {
+		payload = pkt.GetCHAPChallengeResponsePayload(0)
+		p := payload.(*packet.CHAPChallengeResponsePayload)
+		prepareCHAPChallengeOrResponse(p, ctx)
+		payloadSize = 1 + int(p.ValueSize) + len(p.Name)
+	} else if code == packet.CHAPSuccessCode || code == packet.CHAPFailureCode {
+		payload = pkt.GetCHAPSuccessFailurePayload()
+		p := payload.(*packet.CHAPSuccessFailurePayload)
+		prepareCHAPSuccessOrFailurePayload(p, ctx)
+		payloadSize = len(p.Message)
+	} else {
+		return nil
+	}
+
+	// Update length
+	chap.Length = packet.SwapBytesUint16(uint16(types.PPPLen + payloadSize))
+	pppoes.Len = packet.SwapBytesUint16(uint16(types.PPPLen + payloadSize + 2))
+
+	// increase MBuf, TODO: should be moved before allocating payload
+	pkt.EncapsulateTail(pkt.GetPacketLen(), uint(payloadSize))
 	pkt.SerializeCHAPPayload(payload)
-
-	fmt.Println("Constructed CHAP packet:\n", hex.Dump(pkt.GetRawPacketBytes()))
-
 	return nil
 }
 
@@ -213,7 +231,10 @@ func send(ctx session.SessionContext) {
 	}
 
 	protocol, code, err := fromSessionEventToSessionCode(ctx.GetEvent())
-
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	var ok error
 	if protocol == 0 {
 		ok = preparePPPoEPacket(pkt, ctx, code)
@@ -226,7 +247,7 @@ func send(ctx session.SessionContext) {
 	}
 
 	if ok != nil {
-		fmt.Println("Sending packet failed!")
+		fmt.Println("Sending packet failed!", err)
 		return
 	}
 
@@ -252,20 +273,17 @@ func getTagsFromAttributes(attrs map[string]interface{}, totalLen *uint16) []pac
 	var buf bytes.Buffer
     enc := gob.NewEncoder(&buf)
 	for key, val := range attrs {
-		fmt.Println("Encoding value: ", val)
 		err := enc.Encode(val)
 		if err != nil {
 			continue
 		}
 		v := buf.Bytes()[4:]
-		fmt.Println("Encoded value: ", v)
 		tags = append(tags, packet.PPPoETag{Type: packet.PPPoETagMapReversed[key],
 										    Len: uint16(len(v)),
 											Value: v})
 		*totalLen += 4 + uint16(len(v))
 		buf.Reset()
 	}
-	fmt.Println("Tags: ", tags)
 	return tags
 }
 
@@ -275,6 +293,7 @@ func dumper(currentPacket *packet.Packet, context flow.UserContext) {
 }
 
 // This function should return pointer to the VXLAN payload.
+// In case of BNG-CP it should be a pointer to the first byte of BNG Service Header.
 func handleVXLAN(current *packet.Packet, context flow.UserContext) {
 	current.ParseL3()
 	ipv4 := current.GetIPv4()
@@ -289,6 +308,12 @@ func handleVXLAN(current *packet.Packet, context flow.UserContext) {
 		println("UDP not present or it is not VXLAN packet")
 		return
 	}
+}
+
+// This function should decapsulate BNG Service Header and return pointer to its payload.
+// In case of BNG-CP it should be a pointer to the first byte of PPPoED/PPPoES header.
+func handleBNGServiceHeader(current *packet.Packet, context flow.UserContext) {
+
 }
 
 func handlePPPoED(current *packet.Packet, ctx *session.SessionContext) bool {
@@ -319,7 +344,6 @@ func handleLCP(current *packet.Packet, ctx *session.SessionContext) bool {
 func handleCHAP(current *packet.Packet, baseHdr *packet.PPPHdr, ctx *session.SessionContext) {
 	if baseHdr.Code == packet.CHAPChallengeCode || baseHdr.Code == packet.CHAPResponseCode {
 		payload := current.GetCHAPChallengeResponsePayload(packet.SwapBytesUint16(baseHdr.Length))
-		fmt.Println(payload.ValueSize)
 		ctx.SetAttribute("CHAP-Secret", string(payload.Value))
 		ctx.SetAttribute("CHAP-Name", string(payload.Name))
 	}
@@ -336,6 +360,7 @@ func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 	} else if current.Ether.EtherType == types.SwapPPPoESNumber {
 		p := current.GetPPPoES()
 		ppp := current.GetPPPNoOptions()
+		sessionCtx.SetTransactionID(ppp.Identifier)
 		switch packet.SwapBytesUint16(p.Protocol) {
 			case packet.LCP: {
 				handleLCP(current, &sessionCtx)
