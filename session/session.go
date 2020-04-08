@@ -33,6 +33,9 @@ const (
 	IPCPConfNak
 )
 
+// List of Session Attributes
+// TODO: create a list of allowed Session Attributes and replace raw string used in the code
+
 type SessionContext struct {
 	event           SessionEvent
 	subscriberMac   [6]uint8
@@ -105,7 +108,7 @@ func (ctx SessionContext) GetAttributeAsByteArray(attr string) ([]byte, error) {
 	}
 	var err error
 	var bin_buf bytes.Buffer
-	fmt.Printf("Attribute %v type %T\n", val, val)
+
 	switch val.(type) {
 		case string: {
 			_, err = bin_buf.WriteString(val.(string))

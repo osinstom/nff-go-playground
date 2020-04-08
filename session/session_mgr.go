@@ -14,6 +14,7 @@ type SessionManager struct {
 }
 
 func (sm SessionManager) triggerSessionEvent(ctx SessionContext) {
+	// TODO: use log package
 	fmt.Printf("Triggering SessionEvent{ID=%v, SessionID=%v, TransactionID=%v, SessionAttributes=%v}\n",
 		ctx.event, ctx.sessionId, ctx.transactionId, ctx.attributes)
 	sm.SendReplyCallback(ctx)
@@ -21,6 +22,7 @@ func (sm SessionManager) triggerSessionEvent(ctx SessionContext) {
 
 // TODO: This function is just a prototype for the test purpose. It has to be re-implemented in the future.
 func (sm SessionManager) HandleSessionEvent(ctx SessionContext) {
+	// TODO: use log package
 	fmt.Printf("Handling SessionEvent{ID=%v, SessionID=%v, TransactionID=%v, SessionAttributes=%v}\n", ctx.event,
 		ctx.sessionId, ctx.transactionId, ctx.attributes)
 	switch ctx.event {
@@ -59,6 +61,7 @@ func (sm SessionManager) HandleSessionEvent(ctx SessionContext) {
 		case IPCPConfReq: {
 			fmt.Println("IPCP Conf Req received!")
 			ctx.event = IPCPConfAck
+			ctx.SetAttribute("IP-Address", "172.10.0.16")
 		}
 		default: {
 			return
