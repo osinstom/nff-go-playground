@@ -14,6 +14,7 @@ import (
 
 	"nff-go-playground/session"
 	"net"
+	"os/exec"
 )
 
 var pkt_cnt int = 0
@@ -48,9 +49,25 @@ var codeSessionEventMap = map[SessionCode]session.SessionEvent {
 	SessionCode{packet.IPCP, packet.IPCPConfNakCode}	: session.IPCPConfNak,
 }
 
+func disableICMPUnreachable() error {
+	out, err := exec.Command("iptables", "-I", "OUTPUT", "-p", "icmp", "--icmp-type",
+		"destination-unreachable", "-j", "DROP").Output()
+	if err != nil {
+		return fmt.Errorf("disabling ICMP Unreachable failed: %s", out)
+	}
+	return nil
+}
+
 func main() {
 	fmt.Println("App started.")
 	sessionManager = session.SessionManager{SendReplyCallback: send}
+
+	// For VXLAN we should disable ICMP Destination Unreachable. Only for AF_PACKET.
+	err := disableICMPUnreachable()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	config := flow.Config{
 		NeedKNI:  true,
@@ -60,7 +77,7 @@ func main() {
 		// For control plane application it's better to process packets sequentially.
 		BurstSize: 1,
 	}
-	err := flow.SystemInit(&config)
+	err = flow.SystemInit(&config)
 	if err != nil {
 		fmt.Printf("Some error occured: %v\n", err)
 		return
@@ -68,7 +85,7 @@ func main() {
 
 	firstFlow, err := flow.SetReceiver(0)
 	flow.CheckFatal(flow.SetHandler(firstFlow, handleVXLAN, nil))
-	flow.CheckFatal(flow.SetHandler(firstFlow, handleBNGServiceHeader, nil))
+	//flow.CheckFatal(flow.SetHandler(firstFlow, handleBNGServiceHeader, nil))
 	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, nil))
 	flow.CheckFatal(flow.SetSender(firstFlow, 0))
 	flow.CheckFatal(flow.SystemStart())
@@ -319,11 +336,14 @@ func handleVXLAN(current *packet.Packet, context flow.UserContext) {
 	current.ParseL4ForIPv4()
 	udp := current.GetUDPForIPv4()
 
-	if udp == nil || udp.DstPort != 4789 {
+	if udp == nil || udp.DstPort != packet.SwapBytesUint16(4789) {
 		// reject un-tunneled packet
 		fmt.Println("UDP not present or it is not VXLAN packet")
 		return
 	}
+
+	// Remove VXLAN header
+	current.DecapsulateHead(0, types.EtherLen+types.IPv4MinLen+types.UDPLen+types.VXLANLen)
 }
 
 // This function should decapsulate BNG Service Header and return pointer to its payload.
