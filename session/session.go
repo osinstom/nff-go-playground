@@ -40,10 +40,21 @@ type SessionContext struct {
 	event           SessionEvent
 	subscriberMac   [6]uint8
 	sessionId 		uint16
+	vlanId 			uint16
 	// Specifies PPP-level transaction identifier.
 	// Each response for PPP packet must contain the same identifier as request.
 	transactionId   uint8
 	attributes 		map[string]interface{}
+}
+
+func (ctx *SessionContext) String() string {
+	return fmt.Sprintf(`Session Context: Event(%d), Session Identifier(%d), 
+		Transaction (%d), VLAN Tag (%d), Attributes: %s`,
+		ctx.event,
+		ctx.sessionId,
+		ctx.transactionId,
+		ctx.vlanId,
+		ctx.attributes)
 }
 
 func (ctx *SessionContext) SetEvent(evt SessionEvent) {
@@ -68,6 +79,14 @@ func (ctx *SessionContext) SetSessionID(sessionId uint16) {
 
 func (ctx *SessionContext) GetSessionID() uint16 {
 	return ctx.sessionId
+}
+
+func (ctx *SessionContext) SetVLANID(vlanId uint16) {
+	ctx.vlanId = vlanId
+}
+
+func (ctx *SessionContext) GetVLANID() uint16 {
+	return ctx.vlanId
 }
 
 func (ctx *SessionContext) SetTransactionID(transactionId uint8) {

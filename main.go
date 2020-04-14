@@ -17,6 +17,20 @@ import (
 	"os/exec"
 )
 
+type FlowUserContext struct{
+	VlanTag uint16
+}
+
+func (ctx FlowUserContext) Copy() interface{} {
+	return FlowUserContext{
+		VlanTag: ctx.VlanTag,
+	}
+}
+
+func (ctx FlowUserContext) Delete() {
+
+}
+
 var pkt_cnt int = 0
 
 var sessionManager session.SessionManager
@@ -58,8 +72,22 @@ func disableICMPUnreachable() error {
 	return nil
 }
 
+// This function disables VLAN offloading for the NIC.
+// Note that it should be used only for AF_PACKET interfaces.
+// TODO: perhaps it would be better to use make a syscall instead of using system command.
+func prepareNIC(name string) error {
+	out, err := exec.Command("ethtool", "--offload", name, "txvlan", "off", "rxvlan", "off").Output()
+	if err != nil {
+		return fmt.Errorf("configuring VLAN offloading for NIC %s failed: %v", name, out)
+	}
+	return nil
+}
+
 func main() {
 	fmt.Println("App started.")
+	defer func(){
+		fmt.Println("Closing app.")
+	}()
 	sessionManager = session.SessionManager{SendReplyCallback: send}
 
 	// For VXLAN we should disable ICMP Destination Unreachable. Only for AF_PACKET.
@@ -68,12 +96,19 @@ func main() {
 		fmt.Println(err)
 		return
 	}
+	// TODO: this should be called only for AF_PACKET interface.
+	err = prepareNIC("eth0")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	config := flow.Config{
-		NeedKNI:  true,
+		//NeedKNI:  true,
 		// We use AF_PACKET PMD, TODO: should be configurable.
 		// TODO: Interface name should also be configurable.
 		DPDKArgs: []string{"--no-pci", "--vdev=eth_af_packet0,iface=" + "eth0"},
+		//DPDKArgs: []string{"--no-pci", "--vdev=net_af_xdp0,iface=" + "eth0"},
 		// For control plane application it's better to process packets sequentially.
 		BurstSize: 1,
 	}
@@ -83,10 +118,17 @@ func main() {
 		return
 	}
 
+	// Initialize handler context
+	context := new(FlowUserContext)
+
 	firstFlow, err := flow.SetReceiver(0)
-	flow.CheckFatal(flow.SetHandler(firstFlow, handleVXLAN, nil))
-	//flow.CheckFatal(flow.SetHandler(firstFlow, handleBNGServiceHeader, nil))
-	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, nil))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	flow.CheckFatal(flow.SetHandler(firstFlow, handleVXLAN, context))
+	//flow.CheckFatal(flow.SetHandler(firstFlow, handleBNGServiceHeader, context))
+	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, context))
 	flow.CheckFatal(flow.SetSender(firstFlow, 0))
 	flow.CheckFatal(flow.SystemStart())
 }
@@ -292,6 +334,10 @@ func send(ctx session.SessionContext) {
 	pkt.Ether.DAddr = ctx.GetSubscriberMAC()
 	pkt.Ether.SAddr = flow.GetPortMACAddress(0)
 
+	if ctx.GetVLANID() != 0 {
+		pkt.AddVLANTag(ctx.GetVLANID())
+	}
+
 	fmt.Println("Sending packet:\n", hex.Dump(pkt.GetRawPacketBytes()))
 	pkt.SendPacket(0)
 }
@@ -393,10 +439,26 @@ func handleIPCP(pkt *packet.IPCPHdr, ctx *session.SessionContext) {
 
 }
 
+// Read VLAN Tag from the L2 header and remove VLAN tag.
+// Note that this function handles only single-tagged packets. Double-VLAN architecture is not supported.
+func handleVLAN(current *packet.Packet, ctx *session.SessionContext) {
+	vlan := current.ParseL3CheckVLAN()
+	if vlan == nil {  // if there is no VLAN tag, skip handleL2 function.
+		return
+	}
+	ctx.SetVLANID(vlan.GetVLANTagIdentifier())
+	current.RemoveVLANTag()
+}
+
 // TODO: refactor this function, because it looks ugly
 func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
-	current.ParseL3()
 	var sessionCtx session.SessionContext
+
+	// As NFF-Go does not provide the way to share the state between handler I put VLAN handler here.
+	handleVLAN(current, &sessionCtx)
+
+	current.ParseL3()
+
 	if current.Ether.EtherType == types.SwapPPPoEDNumber {
 		ok := handlePPPoED(current, &sessionCtx)
 		if !ok {
