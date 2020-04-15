@@ -1,3 +1,4 @@
+// Package 'session' provides primitives representing User Session within BNG.
 package session
 
 import (
@@ -5,9 +6,9 @@ import (
 	"github.com/intel-go/nff-go/packet"
 )
 
-type SessionHandler interface {
-	HandleSessionEvent(ctx SessionContext)
-}
+//type SessionHandler interface {
+//	HandleSessionEvent(ctx SessionContext)
+//}
 
 type SessionManager struct {
 	SendReplyCallback func(ctx SessionContext)
@@ -26,19 +27,19 @@ func (sm SessionManager) HandleSessionEvent(ctx SessionContext) {
 	switch ctx.event {
 		case PADI: {
 			ctx.event = PADO
-			ctx.appendPPPoEDAttributes()
+			ctx.appendPPPoEDAttributes("", "cbr_bng1_re0")  // FIXME: temp, hardcoded value.
 		}
 		case PADR: {
 			ctx.event = PADS
-			ctx.sessionId = 0x1111
-			ctx.appendPPPoEDAttributes()
+			ctx.sessionId = 0x1111  // FIXME: temp, hardcoded value.
+			ctx.appendPPPoEDAttributes("", "cbr_bng1_re0")  // FIXME: temp, hardcoded value.
 			go sm.triggerSessionEvent(ctx)
-			//time.Sleep(2 * time.Second)
+
 			ctx.event = LCP_ConfReq
 			ctx.transactionId = 55 // new transaction ID
-			ctx.attributes = make(map[string]interface{})
-			ctx.attributes[packet.MaximumReceiveUnitName] = 1492
-			ctx.attributes[packet.MagicNumberName] = 0x643c9869
+			ctx.ResetAttributes()
+			ctx.attributes[packet.MaximumReceiveUnit] = 1492
+			ctx.attributes[packet.MagicNumber] = 0x643c9869
 		}
 		case LCP_ConfReq: {
 			ctx.event = LCP_ConfAck
@@ -46,7 +47,7 @@ func (sm SessionManager) HandleSessionEvent(ctx SessionContext) {
 		case LCP_ConfAck: {
 			ctx.event = CHAPChallenge
 			ctx.transactionId = 171
-			ctx.attributes = make(map[string]interface{})
+			ctx.ResetAttributes()
 			ctx.attributes["CHAP-Secret"] = 0x1154007413920232
 			ctx.attributes["CHAP-Name"] = "JUNOS"
 		}
