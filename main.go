@@ -15,20 +15,83 @@ import (
 	"nff-go-playground/session"
 	"net"
 	"os/exec"
+	"sync"
+	"strings"
 )
 
-type FlowUserContext struct{
-	VlanTag uint16
+var once sync.Once
+
+var (
+	mainAppInstance *BNGControlPlane
+)
+
+const (
+	InitFailedMessage = "BNG Control Plane App initialization failed (%v)"
+)
+
+// BNGControlPlane is an abstraction of this application. Should be singleton.
+// It stores configuration of this application.
+type BNGControlPlane struct {
+	// name of network interface used by this application.
+	NetworkInterface string
+	// MAC address of network interface used by this application.
+	MACAddress 		 types.MACAddress
+	// IP Address of network interface used by this application.
+	IPAddress 		 types.IPv4Address
 }
 
-func (ctx FlowUserContext) Copy() interface{} {
-	return FlowUserContext{
-		VlanTag: ctx.VlanTag,
+// Get singleton instance
+func GetBNGControlPlaneInstance() *BNGControlPlane {
+	once.Do(func() {
+		mainAppInstance = &BNGControlPlane{}
+	})
+	return mainAppInstance
+}
+
+func (app *BNGControlPlane) String() string {
+	return fmt.Sprintf(`BNG Control Plane App: NetworkInterface(%s), MAC Address(%s), IPAddress (%s)`,
+		app.NetworkInterface,
+		app.MACAddress.String(),
+		app.IPAddress.String())
+}
+
+func InitBNGControlPlane(interfaceName string) error {
+	app := GetBNGControlPlaneInstance()
+	app.NetworkInterface = interfaceName
+	intf, err := net.InterfaceByName(interfaceName)
+	if err != nil {
+		return fmt.Errorf(InitFailedMessage, err)
 	}
-}
 
-func (ctx FlowUserContext) Delete() {
+	// Get MAC Address
+	app.MACAddress, err = types.StringToMACAddress(intf.HardwareAddr.String())
+	if err != nil {
+		return fmt.Errorf(InitFailedMessage, err)
+	}
 
+	addrs, err := intf.Addrs()
+	if err != nil {
+		return fmt.Errorf(InitFailedMessage, err)
+	}
+	// Assume that there is only one Address
+	for _, addr := range addrs {
+		if ip := net.ParseIP(strings.Split(addr.String(), "/")[0]); ip != nil {
+			ipv4 := ip.To4()
+			if ipv4 == nil {
+				// it's not IPv4 address
+				continue
+			}
+			app.IPAddress = types.BytesToIPv4(ipv4[0], ipv4[1], ipv4[2], ipv4[3])
+		}
+
+	}
+	if app.IPAddress == 0 {
+		return fmt.Errorf(InitFailedMessage, "Interface has no IPv4 address")
+	}
+
+	fmt.Println("BNG Control Plane application initialized. ", app.String())
+
+	return nil
 }
 
 var pkt_cnt int = 0
@@ -39,6 +102,16 @@ type SessionCode struct {
 	Protocol uint16
 	Code     uint8
 }
+
+type BngDp struct {
+	IPAddr types.IPv4Address
+	MACAddr types.MACAddress
+}
+
+var BngDpMap = map[BngDp]uint8{}
+var BngDpMapReversed = map[uint8]BngDp{} // use reversed map to speed up lookup time for send() function.
+
+var BngId uint8
 
 var codeSessionEventMap = map[SessionCode]session.SessionEvent {
 	// PPPoE Discovery
@@ -88,16 +161,24 @@ func main() {
 	defer func(){
 		fmt.Println("Closing app.")
 	}()
+
+	intfName := "eth0"  // TODO: should be configurable.
+	err := InitBNGControlPlane(intfName)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
 	sessionManager = session.SessionManager{SendReplyCallback: send}
 
 	// For VXLAN we should disable ICMP Destination Unreachable. Only for AF_PACKET.
-	err := disableICMPUnreachable()
+	err = disableICMPUnreachable()
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
 	// TODO: this should be called only for AF_PACKET interface.
-	err = prepareNIC("eth0")
+	err = prepareNIC(intfName)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -118,17 +199,14 @@ func main() {
 		return
 	}
 
-	// Initialize handler context
-	context := new(FlowUserContext)
-
 	firstFlow, err := flow.SetReceiver(0)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	flow.CheckFatal(flow.SetHandler(firstFlow, handleVXLAN, context))
+	flow.CheckFatal(flow.SetHandler(firstFlow, handleVXLAN, nil))
 	//flow.CheckFatal(flow.SetHandler(firstFlow, handleBNGServiceHeader, context))
-	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, context))
+	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, nil))
 	flow.CheckFatal(flow.SetSender(firstFlow, 0))
 	flow.CheckFatal(flow.SystemStart())
 }
@@ -140,6 +218,7 @@ func preparePPPoEPacket(pkt *packet.Packet, ctx session.SessionContext, code uin
 		fmt.Println("Cannot initalizie PPPoED packet!")
 		return errors.New("cannot initialize PPPoED packet")
 	}
+	fmt.Println("PPPoE tags Len: ", totalLen)
 	pppoe := pkt.GetPPPoEDNoTags()
 	pppoe.VersionType = 0x11
 	pppoe.SessionId = ctx.GetSessionID()
@@ -337,9 +416,45 @@ func send(ctx session.SessionContext) {
 	if ctx.GetVLANID() != 0 {
 		pkt.AddVLANTag(ctx.GetVLANID())
 	}
+	fmt.Println(hex.Dump(pkt.GetRawPacketBytes()))
+	fmt.Println("Packet length: ", pkt.GetPacketLen())
+	if ok := pkt.EncapsulateIPv4VXLANGPEoUDP(0, packet.NextProtocolEthernet); !ok {
+		fmt.Println("Error while encapsulating into VXLAN GPE")
+		return
+	}
+	fmt.Println(hex.Dump(pkt.GetRawPacketBytes()))
+	fmt.Println("Packet length: ", pkt.GetPacketLen())
+	length := pkt.GetPacketLen()
+
+	pkt.Ether.SAddr = GetBNGControlPlaneInstance().MACAddress
+	pkt.Ether.DAddr = BngDpMapReversed[ctx.GetBNGDpId()].MACAddr
+	pkt.Ether.EtherType = types.SwapIPV4Number
+	pkt.ParseL3()
+	pktIP := (*packet.IPv4Hdr)(pkt.L3)
+	// construct iphdr
+	pktIP.VersionIhl = 0x45
+	pktIP.TypeOfService = 0
+	pktIP.PacketID = 0x1513
+	pktIP.FragmentOffset = 0
+	pktIP.TimeToLive = 64
+	pktIP.TotalLength = packet.SwapBytesUint16(uint16(length - types.EtherLen))
+	pktIP.DstAddr = BngDpMapReversed[ctx.GetBNGDpId()].IPAddr
+	pktIP.SrcAddr = GetBNGControlPlaneInstance().IPAddress
+	pktIP.NextProtoID = types.UDPNumber
+	pktIP.HdrChecksum = packet.SwapBytesUint16(packet.CalculateIPv4Checksum(pktIP))
+
+	pkt.ParseL4ForIPv4()
+	udp := pkt.GetUDPNoCheck()
+	udp.SrcPort = packet.SwapBytesUint16(packet.UDPPortVXLAN_GPE)
+	udp.DstPort = packet.SwapBytesUint16(packet.UDPPortVXLAN_GPE)
+	udp.DgramLen = packet.SwapBytesUint16(uint16(length - types.EtherLen - types.IPv4MinLen))
+	udp.DgramCksum = 0
 
 	fmt.Println("Sending packet:\n", hex.Dump(pkt.GetRawPacketBytes()))
-	pkt.SendPacket(0)
+	ok := pkt.SendPacket(0)
+	if !ok {
+		fmt.Println("Sending packet failed.")
+	}
 }
 
 func convertToBytes(tags []packet.PPPoETag) []byte {
@@ -386,6 +501,17 @@ func handleVXLAN(current *packet.Packet, context flow.UserContext) {
 		// reject un-tunneled packet
 		fmt.Println("UDP not present or it is not VXLAN packet")
 		return
+	}
+
+	newBngDp := BngDp{IPAddr:ipv4.SrcAddr, MACAddr:current.Ether.SAddr}
+
+	if bngId, err := BngDpMap[newBngDp]; !err {
+		id := uint8(len(BngDpMap))  // set ID of BNG equals to current length
+		BngDpMap[newBngDp] = id
+		BngDpMapReversed[id] = newBngDp
+	} else {
+		// FIXME: really temporary solution
+		BngId = bngId
 	}
 
 	// Remove VXLAN header
@@ -453,6 +579,9 @@ func handleVLAN(current *packet.Packet, ctx *session.SessionContext) {
 // TODO: refactor this function, because it looks ugly
 func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
 	var sessionCtx session.SessionContext
+
+	// FIXME: temporary solution, should be handled by shared
+	sessionCtx.SetBngDpID(BngId)
 
 	// As NFF-Go does not provide the way to share the state between handler I put VLAN handler here.
 	handleVLAN(current, &sessionCtx)
