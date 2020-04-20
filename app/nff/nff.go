@@ -1,3 +1,4 @@
+// Package 'nff' provides primitives for initializing and performing packet processing.
 package nff
 
 import (
@@ -12,14 +13,30 @@ import (
 	"nff-go-playground/app/bngcp"
 )
 
-func InitNFF(intf string, driver common.RxTxDriver) error {
+// FlowContext allows to pass data to the NFF Handler.
+type FlowContext struct {
+	SessionManager session.SessionManager
+}
+
+func (ctx FlowContext) Copy() interface{} {
+	return FlowContext{
+		SessionManager: ctx.SessionManager,
+	}
+}
+
+func (ctx FlowContext) Delete() {}
+
+
+// Initializes NFF Go functions.
+func InitNFF(app *bngcp.BNGControlPlane) error {
+
 	config := flow.Config{
 		// For control plane application it's better to process packets sequentially.
 		BurstSize: 1,
 	}
-	switch driver {
+	switch app.NetworkDriver {
 		case common.AF_PACKET: {
-			config.DPDKArgs = []string{"--no-pci", "--vdev=eth_af_packet0,iface=" + intf}
+			config.DPDKArgs = []string{"--no-pci", "--vdev=eth_af_packet0,iface=" + app.NetworkInterface}
 		}
 	}
 
@@ -29,14 +46,18 @@ func InitNFF(intf string, driver common.RxTxDriver) error {
 		return err
 	}
 
+	context := new(FlowContext)
+	context.SessionManager = app.SessionManager
+
 	firstFlow, err := flow.SetReceiver(0)
 	if err != nil {
 		fmt.Println(err)
 		return err
 	}
 	flow.CheckFatal(flow.SetHandler(firstFlow, handlers.HandleVXLAN, nil))
+	// TODO: implement support for BNG SH header here.
 	//flow.CheckFatal(flow.SetHandler(firstFlow, handleBNGServiceHeader, context))
-	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, nil))
+	flow.CheckFatal(flow.SetHandlerDrop(firstFlow, handlePPPoE, context))
 	flow.CheckFatal(flow.SetSender(firstFlow, 0))
 	return nil
 }
@@ -47,6 +68,7 @@ func Start() {
 
 // TODO: refactor this function, because it looks ugly
  func handlePPPoE(current *packet.Packet, ctx flow.UserContext) bool {
+ 	flowContext := ctx.(FlowContext)
  	var sessionCtx session.SessionContext
  
  	// FIXME: temporary solution, should be handled by shared
@@ -92,8 +114,9 @@ func Start() {
  		return false
  	}
  	sessionCtx.SetSubscriberMAC(current.Ether.SAddr)
+
  	// handle session event in separate goroutine
- 	go bngcp.GetBNGControlPlaneInstance().SessionManager.HandleSessionEvent(sessionCtx)
+ 	go flowContext.SessionManager.HandleSessionEvent(sessionCtx)
  
  	return false
  }

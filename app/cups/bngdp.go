@@ -1,3 +1,4 @@
+// Package 'cups' provides primitives for control and management of BNG DPs associated with this BNG CP.
 package cups
 
 import "github.com/intel-go/nff-go/types"

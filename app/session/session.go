@@ -1,3 +1,4 @@
+// Package 'session' provides primitives representing User Session within BNG.
 package session
 
 import (
@@ -108,7 +109,7 @@ func (ctx *SessionContext) GetBNGDpId() uint8 {
 	return ctx.bngDp
 }
 
-func (ctx *SessionContext) appendPPPoEDAttributes() {
+func (ctx *SessionContext) appendPPPoEDAttributes(serviceName string, acName string) {
 	ctx.attributes = map[string]interface{}{}
 	ctx.attributes["Service-Name"] = ""
 	ctx.attributes["AC-Name"] = "cbr_bng1_re0"

@@ -1,12 +1,14 @@
+// Package 'bngcp' provides types and methods implementing BNG Control Plane object.
 package bngcp
 
 import (
 	"sync"
 	"nff-go-playground/app/session"
 	"fmt"
-	"net"
-	"strings"
 	"github.com/intel-go/nff-go/types"
+	"nff-go-playground/app/common"
+	"nff-go-playground/app/system"
+
 )
 
 var once sync.Once
@@ -22,6 +24,7 @@ const (
 // BNGControlPlane is an abstraction of this application. Should be singleton.
 // It stores configuration of this application.
 type BNGControlPlane struct {
+	NetworkDriver	 common.RxTxDriver
 	// name of network interface used by this application.
 	NetworkInterface string
 	// MAC address of network interface used by this application.
@@ -32,8 +35,16 @@ type BNGControlPlane struct {
 	SessionManager   session.SessionManager
 }
 
+func (app *BNGControlPlane) SetMACAddress(mac types.MACAddress) {
+	app.macAddress = mac
+}
+
 func (app *BNGControlPlane) GetMACAddress() types.MACAddress {
 	return app.macAddress
+}
+
+func (app *BNGControlPlane) SetIPAddress(ip types.IPv4Address) {
+	app.ipAddress = ip
 }
 
 func (app *BNGControlPlane) GetIPAddress() types.IPv4Address {
@@ -55,39 +66,25 @@ func (app *BNGControlPlane) String() string {
 		app.ipAddress.String())
 }
 
-func (app *BNGControlPlane) Init() error {
-	intf, err := net.InterfaceByName(app.NetworkInterface)
+func (app *BNGControlPlane) Configure() error {
+
+	// If DPDK is used, don't retrieve MAC and IP address programmatically
+	if app.NetworkDriver == common.DPDK {
+		return nil
+	}
+
+	mac, err := system.GetMACAddressOfInterface(app.NetworkInterface)
 	if err != nil {
-		return fmt.Errorf(InitFailedMessage, err)
+		return err
 	}
+	app.macAddress = mac
 
-	// Get MAC Address
-	app.macAddress, err = types.StringToMACAddress(intf.HardwareAddr.String())
+	ipAddr, err := system.GetIPAddressOfInterface(app.NetworkInterface)
 	if err != nil {
-		return fmt.Errorf(InitFailedMessage, err)
+		return err
 	}
+	app.SetIPAddress(ipAddr)
 
-	addrs, err := intf.Addrs()
-	if err != nil {
-		return fmt.Errorf(InitFailedMessage, err)
-	}
-	// Assume that there is only one Address
-	for _, addr := range addrs {
-		if ip := net.ParseIP(strings.Split(addr.String(), "/")[0]); ip != nil {
-			ipv4 := ip.To4()
-			if ipv4 == nil {
-				// it's not IPv4 address
-				continue
-			}
-			app.ipAddress = types.BytesToIPv4(ipv4[0], ipv4[1], ipv4[2], ipv4[3])
-		}
-
-	}
-	if app.ipAddress == 0 {
-		return fmt.Errorf(InitFailedMessage, "Interface has no IPv4 address")
-	}
-
-	fmt.Println("BNG Control Plane application initialized. ", app.String())
 
 	return nil
 }
